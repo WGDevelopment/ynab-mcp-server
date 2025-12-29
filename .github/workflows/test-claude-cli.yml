@@ -1,0 +1,383 @@
+# Test Claude CLI Installation and Usage
+# Manual workflow to validate Claude Code CLI setup in GitHub Actions
+#
+# Purpose: Verify installation, authentication, and basic CLI operations work
+# before relying on Claude CLI in production workflows.
+#
+# Usage: Run manually from GitHub Actions tab (workflow_dispatch)
+
+name: Test Claude CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_prompt:
+        description: 'Simple prompt to test CLI invocation'
+        required: false
+        default: 'Say hello and confirm you are working in GitHub Actions'
+        type: string
+      skip_curl_test:
+        description: 'Skip curl installation test'
+        required: false
+        default: false
+        type: boolean
+      skip_npm_test:
+        description: 'Skip npm installation test'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # TEST CURL INSTALLATION
+  # Uses the official curl installer from claude.ai
+  # ============================================================================
+  test-curl-install:
+    name: Test curl Installation
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_curl_test }}
+
+    steps:
+      - name: System info
+        run: |
+          echo "=== System Information ==="
+          echo "Runner: $(uname -a)"
+          echo "Shell: $SHELL"
+          echo "Node version: $(node --version 2>/dev/null || echo 'Not installed')"
+          echo "npm version: $(npm --version 2>/dev/null || echo 'Not installed')"
+          echo "Working directory: $(pwd)"
+          echo "=========================="
+
+      - name: Install Claude CLI via curl
+        id: curl-install
+        run: |
+          echo "Downloading and running Claude installer..."
+          curl -fsSL https://claude.ai/install.sh | bash
+
+          echo ""
+          echo "Checking installation..."
+
+          # Add to PATH for this session
+          export PATH="$HOME/.claude/bin:$PATH"
+
+          # Verify binary exists
+          if command -v claude &> /dev/null; then
+            echo "SUCCESS: claude command found"
+            echo "Location: $(which claude)"
+            echo "curl_install_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "FAILED: claude command not found"
+            echo "Checking common locations..."
+            ls -la ~/.claude/ 2>/dev/null || echo "~/.claude not found"
+            ls -la ~/.claude/bin/ 2>/dev/null || echo "~/.claude/bin not found"
+            echo "curl_install_success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Verify curl installation
+        if: steps.curl-install.outputs.curl_install_success == 'true'
+        run: |
+          export PATH="$HOME/.claude/bin:$PATH"
+
+          echo "=== Version Check ==="
+          claude --version || echo "Version check failed"
+
+          echo ""
+          echo "=== Help Output ==="
+          claude --help || echo "Help check failed"
+
+      - name: Test authentication (curl install)
+        if: steps.curl-install.outputs.curl_install_success == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          export PATH="$HOME/.claude/bin:$PATH"
+
+          echo "=== Testing Authentication ==="
+
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "WARNING: CLAUDE_CODE_OAUTH_TOKEN is not set"
+            echo "Authentication test skipped - no token available"
+            exit 0
+          fi
+
+          echo "Token is set (length: ${#CLAUDE_CODE_OAUTH_TOKEN} chars)"
+
+          # Test simple prompt execution
+          echo "Running test prompt..."
+          echo "Hello, please respond with 'CLI test successful' to confirm you are working." | claude -p 2>&1 || {
+            echo "Prompt execution failed"
+            echo "Trying alternate syntax..."
+            claude -p "Hello, please respond with 'CLI test successful'" 2>&1 || {
+              echo "Both prompt syntaxes failed"
+              exit 1
+            }
+          }
+
+          echo ""
+          echo "=== Authentication Test Complete ==="
+
+  # ============================================================================
+  # TEST NPM INSTALLATION
+  # Uses npm to install @anthropic-ai/claude-code
+  # ============================================================================
+  test-npm-install:
+    name: Test npm Installation
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_npm_test }}
+
+    steps:
+      - name: System info
+        run: |
+          echo "=== System Information ==="
+          echo "Runner: $(uname -a)"
+          echo "Node version: $(node --version)"
+          echo "npm version: $(npm --version)"
+          echo "=========================="
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Install Claude CLI via npm
+        id: npm-install
+        run: |
+          echo "Installing @anthropic-ai/claude-code globally..."
+          npm install -g @anthropic-ai/claude-code
+
+          echo ""
+          echo "Checking installation..."
+
+          if command -v claude &> /dev/null; then
+            echo "SUCCESS: claude command found"
+            echo "Location: $(which claude)"
+            echo "npm_install_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "FAILED: claude command not found"
+            echo "Checking npm global bin..."
+            npm bin -g
+            ls -la "$(npm bin -g)" 2>/dev/null || echo "Cannot list npm global bin"
+            echo "npm_install_success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Verify npm installation
+        if: steps.npm-install.outputs.npm_install_success == 'true'
+        run: |
+          echo "=== Version Check ==="
+          claude --version
+
+          echo ""
+          echo "=== Help Output ==="
+          claude --help
+
+      - name: Test authentication (npm install)
+        if: steps.npm-install.outputs.npm_install_success == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          echo "=== Testing Authentication ==="
+
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "WARNING: CLAUDE_CODE_OAUTH_TOKEN is not set"
+            echo "Authentication test skipped - no token available"
+            exit 0
+          fi
+
+          echo "Token is set (length: ${#CLAUDE_CODE_OAUTH_TOKEN} chars)"
+
+          # Test simple prompt execution
+          echo "Running test prompt..."
+          echo "Hello, please respond with 'CLI test successful' to confirm you are working." | claude -p 2>&1 || {
+            echo "Prompt execution failed"
+            echo "Trying alternate syntax..."
+            claude -p "Hello, please respond with 'CLI test successful'" 2>&1 || {
+              echo "Both prompt syntaxes failed"
+              exit 1
+            }
+          }
+
+          echo ""
+          echo "=== Authentication Test Complete ==="
+
+  # ============================================================================
+  # TEST BASIC USAGE
+  # Actually run Claude with a real prompt after confirming installation works
+  # ============================================================================
+  test-basic-usage:
+    name: Test Basic CLI Usage
+    runs-on: ubuntu-latest
+    needs: [test-npm-install]
+    if: ${{ always() && (needs.test-npm-install.result == 'success' || inputs.skip_npm_test) }}
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Install Claude CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Test custom prompt
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "ERROR: CLAUDE_CODE_OAUTH_TOKEN is required for this test"
+            exit 1
+          fi
+
+          echo "=== Running Custom Prompt ==="
+          echo "Prompt: ${{ inputs.test_prompt }}"
+          echo ""
+
+          # Run the user-provided prompt
+          echo "${{ inputs.test_prompt }}" | claude -p
+
+          echo ""
+          echo "=== Prompt Execution Complete ==="
+
+      - name: Test multi-line prompt
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "Skipping - no token"
+            exit 0
+          fi
+
+          echo "=== Testing Multi-line Prompt ==="
+
+          cat << 'EOF' | claude -p
+          Please provide a brief response to confirm the following:
+          1. You are Claude
+          2. You are running in a CI/CD environment
+          3. You can process multi-line input
+
+          Keep your response under 50 words.
+          EOF
+
+          echo ""
+          echo "=== Multi-line Test Complete ==="
+
+      - name: Test output capture
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "Skipping - no token"
+            exit 0
+          fi
+
+          echo "=== Testing Output Capture ==="
+
+          # Capture output to file
+          echo "What is 2 + 2? Reply with just the number." | claude -p > output.txt 2>&1
+
+          echo "Output saved to file:"
+          cat output.txt
+
+          # Check if output contains expected content
+          if grep -qE "4|four" output.txt; then
+            echo "SUCCESS: Got expected answer"
+          else
+            echo "WARNING: Unexpected output (may still be valid)"
+          fi
+
+          echo ""
+          echo "=== Output Capture Test Complete ==="
+
+  # ============================================================================
+  # SUMMARY
+  # Aggregate results from all tests
+  # ============================================================================
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-curl-install, test-npm-install, test-basic-usage]
+    if: always()
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Claude CLI Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          # curl install result
+          if [ "${{ needs.test-curl-install.result }}" == "success" ]; then
+            echo "| curl Installation | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.test-curl-install.result }}" == "skipped" ]; then
+            echo "| curl Installation | :fast_forward: Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| curl Installation | :x: Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # npm install result
+          if [ "${{ needs.test-npm-install.result }}" == "success" ]; then
+            echo "| npm Installation | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.test-npm-install.result }}" == "skipped" ]; then
+            echo "| npm Installation | :fast_forward: Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| npm Installation | :x: Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Basic usage result
+          if [ "${{ needs.test-basic-usage.result }}" == "success" ]; then
+            echo "| Basic Usage | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.test-basic-usage.result }}" == "skipped" ]; then
+            echo "| Basic Usage | :fast_forward: Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Basic Usage | :x: Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.test-npm-install.result }}" == "success" ]; then
+            echo "**npm installation is recommended** for GitHub Actions:" >> $GITHUB_STEP_SUMMARY
+            echo '```yaml' >> $GITHUB_STEP_SUMMARY
+            echo '- name: Setup Node.js' >> $GITHUB_STEP_SUMMARY
+            echo '  uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0' >> $GITHUB_STEP_SUMMARY
+            echo '  with:' >> $GITHUB_STEP_SUMMARY
+            echo "    node-version: '20'" >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '- name: Install Claude CLI' >> $GITHUB_STEP_SUMMARY
+            echo '  run: npm install -g @anthropic-ai/claude-code' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## CLI Syntax" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "For non-interactive use (pipe mode):" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo 'echo "Your prompt here" | claude -p' >> $GITHUB_STEP_SUMMARY
+          echo 'cat prompt_file.txt | claude -p' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by test-claude-cli.yml workflow*" >> $GITHUB_STEP_SUMMARY
+
+      - name: Final status
+        run: |
+          echo "Test Results:"
+          echo "  curl install: ${{ needs.test-curl-install.result }}"
+          echo "  npm install: ${{ needs.test-npm-install.result }}"
+          echo "  basic usage: ${{ needs.test-basic-usage.result }}"
+
+          # Fail if critical tests failed
+          if [ "${{ needs.test-npm-install.result }}" == "failure" ] && [ "${{ inputs.skip_npm_test }}" != "true" ]; then
+            echo "ERROR: npm installation test failed"
+            exit 1
+          fi
