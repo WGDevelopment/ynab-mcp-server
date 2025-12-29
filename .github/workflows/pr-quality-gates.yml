@@ -344,14 +344,21 @@ jobs:
         run: mypy src/ --ignore-missing-imports || true
         continue-on-error: true
 
+
   # ============================================================================
-  # CLAUDE REVIEW - AI-powered code review (runs after all security gates)
+  # CLAUDE REVIEW - AI-powered code review using Claude Code CLI directly
+  # Uses ANTHROPIC_API_KEY for authentication (pay-as-you-go)
   # ============================================================================
   claude:
     name: Claude Code Review
     runs-on: ubuntu-latest
     needs: [tests, semgrep, dependency-check, lint, type-check]
-    if: always()
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
 
     steps:
       - name: Checkout code
@@ -365,53 +372,106 @@ jobs:
           path: security-artifacts
         continue-on-error: true
 
-      - name: Claude Review
-        uses: anthropics/anthropic-quickstarts@d82f33dd43fceb69b32fd0cddc0cc1dc78c33512  # claude-code-action-v1.0.1
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: claude-sonnet-4-20250514
-          timeout_minutes: 10
-          direct_prompt: |
-            Review this pull request for bugs, security issues, and breaking changes.
+          node-version: "20"
 
-            ## Security Context
-            This is a YNAB MCP Server that handles financial data. Key security concerns:
-            - YNAB API token handling (stored in OS keyring or env var)
-            - No tokens should be logged or transmitted to unintended destinations
-            - Input validation for financial transactions
-            - Proper error handling that doesn't leak sensitive info
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
 
-            ## For Dependabot PRs:
-            - Check changelog for breaking changes
-            - Scan codebase for affected API patterns
-            - If safe: APPROVE and suggest enabling auto-merge
-            - If breaking changes or security concerns: REQUEST CHANGES with explanation
+      - name: Get PR diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+          echo "PR diff saved ($(wc -l < pr_diff.txt) lines)"
 
-            ## For Regular PRs:
-            - Review any security findings from previous workflow steps
-            - Check for common Python vulnerabilities:
-              - SQL injection (if applicable)
-              - Command injection
-              - Path traversal
-              - Insecure deserialization
-              - Secret exposure in logs
-            - Verify input validation on MCP tool inputs
-            - Check error handling doesn't expose sensitive data
-            - REQUEST CHANGES if code is unsafe to merge
+      - name: Run Claude Code Review
+        id: claude-review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Create review prompt file
+          cat > review_prompt.txt << 'PROMPT_EOF'
+          Review this pull request for the ynab-mcp-server project.
 
-            ## Response Guidelines
-            - Be concise and actionable
-            - Fail closed: if uncertain about security, request changes
-            - Praise good security practices when observed
-        continue-on-error: true
+          ## Security Context
+          This is a YNAB MCP Server that handles financial data. Key security concerns:
+          - YNAB API token handling (stored in OS keyring or env var)
+          - No tokens should be logged or transmitted to unintended destinations
+          - Input validation for financial transactions
+          - Proper error handling that doesnt leak sensitive info
+
+          ## For Dependabot PRs:
+          - Check changelog for breaking changes
+          - Scan codebase for affected API patterns
+          - If safe: recommend APPROVE
+          - If breaking changes or security concerns: recommend REQUEST CHANGES with explanation
+
+          ## For Regular PRs:
+          - Check for common Python vulnerabilities
+          - Verify input validation on MCP tool inputs
+          - Check error handling doesnt expose sensitive data
+
+          ## Response Format
+          Provide a concise review with:
+          1. Summary of changes (2-3 sentences)
+          2. Security analysis
+          3. Recommendation: APPROVE or REQUEST_CHANGES
+          4. Any specific issues found
+
+          Be concise but thorough. Fail closed: if uncertain about security, recommend REQUEST_CHANGES.
+          PROMPT_EOF
+
+          # Append diff to prompt
+          echo "" >> review_prompt.txt
+          echo "## PR Diff" >> review_prompt.txt
+          cat pr_diff.txt >> review_prompt.txt
+
+          # Run Claude in non-interactive print mode
+          cat review_prompt.txt | claude -p > review_output.txt 2>&1 || true
+
+          # Check if we got meaningful output
+          if [ ! -s review_output.txt ] || [ "$(wc -c < review_output.txt)" -lt 50 ]; then
+            echo "Claude review produced minimal output, adding fallback message"
+            echo "Review could not be completed automatically. Please review manually." > review_output.txt
+          fi
+
+          echo "Review output preview:"
+          head -20 review_output.txt
+
+      - name: Post review comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Prepare comment with header
+          {
+            echo "## Claude Code Review"
+            echo ""
+            cat review_output.txt
+            echo ""
+            echo "---"
+            echo "*Automated review by Claude Code CLI*"
+          } > final_comment.txt
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file final_comment.txt
+
+      - name: Check for blocking issues
+        run: |
+          # Check if Claude recommended requesting changes
+          if grep -qiE "REQUEST_CHANGES|blocking issue|critical.*issue|must.*fix" review_output.txt; then
+            echo "::warning::Claude identified potential blocking issues - review recommended"
+          fi
 
       - name: Check gate status
         if: always()
         run: |
           echo "Checking if all security gates passed..."
 
-          # Check job results from needs context
           TESTS_RESULT="${{ needs.tests.result }}"
           SEMGREP_RESULT="${{ needs.semgrep.result }}"
           DEPENDENCY_RESULT="${{ needs.dependency-check.result }}"
@@ -424,7 +484,6 @@ jobs:
           echo "Lint: $LINT_RESULT"
           echo "Type Check: $TYPE_CHECK_RESULT"
 
-          # Fail if critical gates failed (not just warnings)
           if [ "$SEMGREP_RESULT" = "failure" ]; then
             echo "::error::Semgrep security scan found CRITICAL/HIGH issues"
             exit 1
