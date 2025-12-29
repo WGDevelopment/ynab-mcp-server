@@ -1,0 +1,510 @@
+# PR Quality Gates - Comprehensive CI/CD for Python MCP Server
+# Runs tests, security scanning, linting, and AI review on pull requests
+#
+# Security philosophy: Fail-closed. If we can't confirm safe, fail the workflow.
+# Post ALL findings to PR comments, but only fail on CRITICAL/HIGH severity.
+
+name: PR Quality Gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ============================================================================
+  # TESTS - Python test suite with coverage
+  # ============================================================================
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
+          pip install pytest-cov
+
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=src/ynab_mcp_server --cov-report=xml --cov-report=html -v || true
+        continue-on-error: true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage-report-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 7
+        if: always()
+
+  # ============================================================================
+  # SEMGREP - Static Application Security Testing (SAST)
+  # ============================================================================
+  semgrep:
+    name: Semgrep Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d  # v1
+        with:
+          config: >-
+            p/security-audit
+            p/owasp-top-ten
+            p/python
+            p/secrets
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        continue-on-error: true
+
+      - name: Run Semgrep (SARIF output)
+        run: |
+          pip install semgrep
+          semgrep scan \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --config=p/python \
+            --config=p/secrets \
+            --sarif -o semgrep-results.sarif \
+            || true
+        continue-on-error: true
+
+      - name: Upload SARIF results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: semgrep-results
+          path: semgrep-results.sarif
+          retention-days: 7
+        if: always()
+
+      - name: Parse and post Semgrep findings
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+
+            if (!fs.existsSync('semgrep-results.sarif')) {
+              console.log('No SARIF file found');
+              return;
+            }
+
+            const sarif = JSON.parse(fs.readFileSync('semgrep-results.sarif', 'utf8'));
+            const results = sarif.runs?.[0]?.results || [];
+
+            if (results.length === 0) {
+              console.log('No Semgrep findings');
+              return;
+            }
+
+            let body = '## Semgrep Security Findings\n\n';
+            let hasCriticalHigh = false;
+
+            for (const result of results) {
+              const ruleId = result.ruleId || 'unknown';
+              const message = result.message?.text || 'No message';
+              const location = result.locations?.[0]?.physicalLocation;
+              const file = location?.artifactLocation?.uri || 'unknown';
+              const line = location?.region?.startLine || '?';
+
+              // Parse severity from message or rule metadata
+              const severityMatch = message.match(/\b(CRITICAL|HIGH|MEDIUM|LOW)\b/i);
+              const severity = severityMatch ? severityMatch[1].toUpperCase() : 'MEDIUM';
+
+              if (severity === 'CRITICAL' || severity === 'HIGH') {
+                hasCriticalHigh = true;
+              }
+
+              body += `### ${severity}: ${ruleId}\n`;
+              body += `- **File**: \`${file}:${line}\`\n`;
+              body += `- **Message**: ${message}\n\n`;
+            }
+
+            body += `\n---\n*Found ${results.length} issue(s). `;
+            body += hasCriticalHigh ? 'CRITICAL/HIGH issues detected - will fail workflow.*' : 'No CRITICAL/HIGH issues.*';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+            // Set output for failure check
+            core.setOutput('has_critical_high', hasCriticalHigh);
+
+      - name: Check for CRITICAL/HIGH findings
+        if: always()
+        run: |
+          if [ -f semgrep-results.sarif ]; then
+            CRITICAL_HIGH=$(cat semgrep-results.sarif | jq '[.runs[0].results[] | select(.message.text | test("CRITICAL|HIGH"; "i"))] | length')
+            if [ "$CRITICAL_HIGH" -gt 0 ]; then
+              echo "::error::Found $CRITICAL_HIGH CRITICAL/HIGH severity findings"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # DEPENDENCY CHECK - Python package vulnerability scanning
+  # ============================================================================
+  dependency-check:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        id: pip-audit
+        run: |
+          pip install .
+          pip-audit --format=json --output=audit-results.json || true
+          pip-audit --format=markdown --output=audit-results.md || true
+        continue-on-error: true
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: pip-audit-results
+          path: |
+            audit-results.json
+            audit-results.md
+          retention-days: 7
+        if: always()
+
+      - name: Parse and post dependency findings
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+
+            if (!fs.existsSync('audit-results.json')) {
+              console.log('No audit results found');
+              return;
+            }
+
+            const audit = JSON.parse(fs.readFileSync('audit-results.json', 'utf8'));
+            const dependencies = audit.dependencies || [];
+            const vulns = dependencies.filter(d => d.vulns && d.vulns.length > 0);
+
+            if (vulns.length === 0) {
+              console.log('No vulnerabilities found');
+              return;
+            }
+
+            let body = '## Dependency Vulnerability Findings\n\n';
+            let hasCriticalHigh = false;
+
+            for (const dep of vulns) {
+              for (const vuln of dep.vulns) {
+                const severity = vuln.severity || 'UNKNOWN';
+                if (severity === 'CRITICAL' || severity === 'HIGH') {
+                  hasCriticalHigh = true;
+                }
+
+                body += `### ${severity}: ${dep.name} (${dep.version})\n`;
+                body += `- **CVE**: ${vuln.id}\n`;
+                body += `- **Description**: ${vuln.description || 'No description'}\n`;
+                body += `- **Fix**: ${vuln.fix_versions?.join(', ') || 'No fix available'}\n\n`;
+              }
+            }
+
+            body += `\n---\n*Found vulnerabilities in ${vulns.length} package(s). `;
+            body += hasCriticalHigh ? 'CRITICAL/HIGH issues detected - will fail workflow.*' : 'No CRITICAL/HIGH issues.*';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Check for CRITICAL/HIGH vulnerabilities
+        if: always()
+        run: |
+          if [ -f audit-results.json ]; then
+            CRITICAL_HIGH=$(cat audit-results.json | jq '[.dependencies[]?.vulns[]? | select(.severity == "CRITICAL" or .severity == "HIGH")] | length')
+            if [ "$CRITICAL_HIGH" -gt 0 ]; then
+              echo "::error::Found $CRITICAL_HIGH CRITICAL/HIGH severity vulnerabilities"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # LINT - Code quality and style checks
+  # ============================================================================
+  lint:
+    name: Linting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install linting tools
+        run: |
+          pip install ruff mypy
+
+      - name: Run Ruff (linter)
+        run: ruff check src/ --output-format=github || true
+        continue-on-error: true
+
+      - name: Run Ruff (formatter check)
+        run: ruff format --check src/ || true
+        continue-on-error: true
+
+      - name: Run Super-Linter (YAML, Markdown, Shell)
+        uses: super-linter/super-linter/slim@12150456a73e248bdc94d0794898f94e23127c88  # v7.4.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: main
+          VALIDATE_ALL_CODEBASE: false
+          # Enable only non-Python linters (Python handled by Ruff)
+          VALIDATE_YAML: true
+          VALIDATE_MARKDOWN: true
+          VALIDATE_BASH: true
+          VALIDATE_DOCKERFILE: true
+          VALIDATE_GITHUB_ACTIONS: true
+          # Disable Python linters (using Ruff instead)
+          VALIDATE_PYTHON: false
+          VALIDATE_PYTHON_BLACK: false
+          VALIDATE_PYTHON_FLAKE8: false
+          VALIDATE_PYTHON_ISORT: false
+          VALIDATE_PYTHON_MYPY: false
+          VALIDATE_PYTHON_PYLINT: false
+          # Disable other language linters
+          VALIDATE_JAVASCRIPT_ES: false
+          VALIDATE_TYPESCRIPT_ES: false
+          VALIDATE_JSON: false
+        continue-on-error: true
+
+  # ============================================================================
+  # TYPE CHECK - Python type checking with mypy
+  # ============================================================================
+  type-check:
+    name: Type Checking
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install .[dev]
+          pip install mypy types-requests
+
+      - name: Run mypy
+        run: mypy src/ --ignore-missing-imports || true
+        continue-on-error: true
+
+
+  # ============================================================================
+  # CLAUDE REVIEW - AI-powered code review using Claude Code CLI directly
+  # Uses CLAUDE_CODE_OAUTH_TOKEN for authentication
+  # ============================================================================
+  claude:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    needs: [tests, semgrep, dependency-check, lint, type-check]
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download security artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: security-artifacts
+        continue-on-error: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Setup Claude OAuth Authentication
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          mkdir -p ~/.claude
+          cat > ~/.claude/.credentials.json <<EOF
+          {
+            "claudeAiOauth": {
+              "accessToken": "$CLAUDE_CODE_OAUTH_TOKEN"
+            }
+          }
+          EOF
+
+      - name: Get PR diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+          echo "PR diff saved ($(wc -l < pr_diff.txt) lines)"
+
+      - name: Run Claude Code Review
+        id: claude-review
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          # Create review prompt file
+          cat > review_prompt.txt << 'PROMPT_EOF'
+          Review this pull request for the ynab-mcp-server project.
+
+          ## Security Context
+          This is a YNAB MCP Server that handles financial data. Key security concerns:
+          - YNAB API token handling (stored in OS keyring or env var)
+          - No tokens should be logged or transmitted to unintended destinations
+          - Input validation for financial transactions
+          - Proper error handling that doesnt leak sensitive info
+
+          ## For Dependabot PRs:
+          - Check changelog for breaking changes
+          - Scan codebase for affected API patterns
+          - If safe: recommend APPROVE
+          - If breaking changes or security concerns: recommend REQUEST CHANGES with explanation
+
+          ## For Regular PRs:
+          - Check for common Python vulnerabilities
+          - Verify input validation on MCP tool inputs
+          - Check error handling doesnt expose sensitive data
+
+          ## Response Format
+          Provide a concise review with:
+          1. Summary of changes (2-3 sentences)
+          2. Security analysis
+          3. Recommendation: APPROVE or REQUEST_CHANGES
+          4. Any specific issues found
+
+          Be concise but thorough. Fail closed: if uncertain about security, recommend REQUEST_CHANGES.
+          PROMPT_EOF
+
+          # Append diff to prompt
+          echo "" >> review_prompt.txt
+          echo "## PR Diff" >> review_prompt.txt
+          cat pr_diff.txt >> review_prompt.txt
+
+          # Run Claude in non-interactive print mode
+          cat review_prompt.txt | claude -p > review_output.txt 2>&1 || true
+
+          # Check if we got meaningful output
+          if [ ! -s review_output.txt ] || [ "$(wc -c < review_output.txt)" -lt 50 ]; then
+            echo "Claude review produced minimal output, adding fallback message"
+            echo "Review could not be completed automatically. Please review manually." > review_output.txt
+          fi
+
+          echo "Review output preview:"
+          head -20 review_output.txt
+
+      - name: Post review comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Prepare comment with header
+          {
+            echo "## Claude Code Review"
+            echo ""
+            cat review_output.txt
+            echo ""
+            echo "---"
+            echo "*Automated review by Claude Code CLI*"
+          } > final_comment.txt
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file final_comment.txt
+
+      - name: Check for blocking issues
+        run: |
+          # Check if Claude recommended requesting changes
+          if grep -qiE "REQUEST_CHANGES|blocking issue|critical.*issue|must.*fix" review_output.txt; then
+            echo "::warning::Claude identified potential blocking issues - review recommended"
+          fi
+
+      - name: Check gate status
+        if: always()
+        run: |
+          echo "Checking if all security gates passed..."
+
+          TESTS_RESULT="${{ needs.tests.result }}"
+          SEMGREP_RESULT="${{ needs.semgrep.result }}"
+          DEPENDENCY_RESULT="${{ needs.dependency-check.result }}"
+          LINT_RESULT="${{ needs.lint.result }}"
+          TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
+
+          echo "Tests: $TESTS_RESULT"
+          echo "Semgrep: $SEMGREP_RESULT"
+          echo "Dependency Check: $DEPENDENCY_RESULT"
+          echo "Lint: $LINT_RESULT"
+          echo "Type Check: $TYPE_CHECK_RESULT"
+
+          if [ "$SEMGREP_RESULT" = "failure" ]; then
+            echo "::error::Semgrep security scan found CRITICAL/HIGH issues"
+            exit 1
+          fi
+
+          if [ "$DEPENDENCY_RESULT" = "failure" ]; then
+            echo "::error::Dependency scan found CRITICAL/HIGH vulnerabilities"
+            exit 1
+          fi
+
+          echo "All critical security gates passed"

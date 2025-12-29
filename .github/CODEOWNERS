@@ -1,0 +1,9 @@
+# CODEOWNERS for ynab-mcp-server
+# These owners will be requested for review when PRs touch matching files
+
+# Default owner for all files
+* @WGDevelopment
+
+# Security-sensitive files require extra review
+src/ynab_mcp_server/api.py @WGDevelopment
+pyproject.toml @WGDevelopment

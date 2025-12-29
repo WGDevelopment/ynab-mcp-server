@@ -1,0 +1,10 @@
+# Trivy ignore file for ynab-mcp-server
+# Add CVE IDs here to ignore specific vulnerabilities with justification
+#
+# Format: CVE-YYYY-NNNNN # Justification for ignoring
+#
+# Examples:
+# CVE-2023-12345 # False positive, not applicable to our use case
+# CVE-2024-67890 # Waiting for upstream fix, mitigated by X
+#
+# Currently no exceptions configured. Add entries only with documented justification.
