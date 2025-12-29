@@ -347,7 +347,7 @@ jobs:
 
   # ============================================================================
   # CLAUDE REVIEW - AI-powered code review using Claude Code CLI directly
-  # Uses ANTHROPIC_API_KEY for authentication (pay-as-you-go)
+  # Uses CLAUDE_CODE_OAUTH_TOKEN for authentication (pay-as-you-go)
   # ============================================================================
   claude:
     name: Claude Code Review
@@ -392,7 +392,7 @@ jobs:
       - name: Run Claude Code Review
         id: claude-review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           # Create review prompt file
           cat > review_prompt.txt << 'PROMPT_EOF'
